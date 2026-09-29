@@ -1,25 +1,49 @@
-// The smallest agent worth running. Three required fields and a greeting.
-//
-// Everything you leave out has a default: a managed model, 24 kHz PCM both
-// ways, adaptive turn detection, interruptions. The other files here each
-// take one of those defaults and put it in your hands.
-//
-// https://www.assemblyai.com/docs/voice-agents/voice-agent-api/create-agent
+// agents/minimal.jsonc
 {
-  // Shown in the AssemblyAI dashboard. Safe to rename: the agent is tracked
-  // by the AGENT_ID in your .env, not by this.
-  "name": "Minimal agent",
-
-  // Who the agent is and what it may say. Voice-first: short spoken
-  // sentences, no bullet points, no formatting read aloud.
-  // https://www.assemblyai.com/docs/voice-agents/voice-agent-api/prompting-guide
-  "system_prompt": "You are a friendly assistant on a voice call. Keep every reply to one or two short sentences. Answer what was asked, lead with the answer, and skip the preamble. If you don't know something, say so. No exclamation marks.",
-
-  // Voice catalog: https://www.assemblyai.com/docs/voice-agents/voice-agent-api/voices
-  "voice": { "voice_id": "anna" },
-
-  // The one optional field worth setting every time. Without it the agent
-  // says nothing when the call connects, and silence reads as a broken line.
-  // https://www.assemblyai.com/docs/voice-agents/voice-agent-api/greeting
-  "greeting": "Hey, what can I do for you?"
+  "name": "Parkbase Voice Agent",
+  "voice": "nova", // Natural, warm female voice. Alternatives: 'echo' (male), 'onyx' (deep)
+  "first_message": "Hi! Welcome to Parkbase. I'm your parking assistant. What kind of vehicle are you driving today?",
+  "language": "en",
+  "prompt": "You are Parkbase, a friendly human-like parking concierge.\n\nCONVERSATION STYLE:\n- Speak in short, natural sentences. Max 15 words per turn.\n- NEVER use robotic phrases like 'I have detected' or 'Processing request'. Say 'Got it' or 'Checking now'.\n- ALWAYS confirm before acting: 'So that's a 4W for 3 hours, right?'\n- If interrupted, STOP speaking immediately.\n- Use filler words naturally: 'Let me see...', 'One moment...'\n\nWORKFLOW:\n1. Greet → Ask vehicle type (2W/4W/EV)\n2. Check availability → Report count naturally: 'I found 12 spots open.'\n3. Ask duration → Calculate price mentally\n4. Suggest ONE best spot first: 'C38 is near the exit. Want that one?'\n5. Confirm reservation → Ask payment preference\n6. If prepaid: 'Sent payment link to WhatsApp.'\n7. If postpaid: 'No payment needed now. Settle at exit.'\n8. Navigation: 'Spot C38, First Floor. Go straight, left at Zone C.'\n\nTOOLS: Use check_parking_availability, reserve_spot, get_navigation ONLY after confirming details.",
+  "tools": [
+    {
+      "name": "check_availability",
+      "description": "Check available parking spots for a vehicle type",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "vehicle_type": {
+            "type": "string",
+            "enum": ["2W", "4W", "EV"],
+            "description": "Type of vehicle"
+          }
+        },
+        "required": ["vehicle_type"]
+      }
+    },
+    {
+      "name": "reserve_spot",
+      "description": "Reserve a specific parking spot",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "spot_id": { "type": "string", "description": "e.g., C2" },
+          "duration_hours": { "type": "number", "description": "Hours to park" },
+          "vehicle_type": { "type": "string", "enum": ["2W", "4W", "EV"] }
+        },
+        "required": ["spot_id", "duration_hours", "vehicle_type"]
+      }
+    },
+    {
+      "name": "get_navigation",
+      "description": "Get directions to a spot",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "spot_id": { "type": "string" }
+        },
+        "required": ["spot_id"]
+      }
+    }
+  ]
 }

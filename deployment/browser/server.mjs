@@ -1,24 +1,106 @@
 #!/usr/bin/env node
-// Talk to your agent from a browser tab.
-//
-//   npm start
-//
-// The API key stays in this process; the page only gets 60-second tokens.
-
+// Parkbase MVP - Voice Agent + Simulated Backend Integration
 import http from 'node:http'
 import { aai, loadEnv, publishAgent, readAgent, required, storedAgentId } from '../../lib.mjs'
 
 loadEnv()
 required('ASSEMBLYAI_API_KEY', 'get one at https://www.assemblyai.com/dashboard/api-keys')
 
-// A published id means the agent is managed elsewhere, so use it as it is.
+// --- PARKBASE BACKEND SIMULATION ---
+class ParkbaseBackend {
+  constructor() {
+    this.lotId = 'LOT-A';
+    this.inventory = [
+      { id: 'C2', level: '1', section: 'B', rate: 60, available: true },
+      { id: 'A5', level: '2', section: 'A', rate: 50, available: true },
+      { id: 'D1', level: '1', section: 'D', rate: 60, available: false },
+    ];
+    this.reservations = new Map();
+    this.logs = [];
+  }
+
+  log(type, message) {
+    const entry = `[${new Date().toLocaleTimeString()}] ${type}: ${message}`;
+    this.logs.unshift(entry);
+    console.log(entry);
+    return entry;
+  }
+
+  // 1. ANPR / LPR Simulation
+  detectVehicle(plateNumber) {
+    this.log('ANPR', `Vehicle detected: ${plateNumber}`);
+    return { plateNumber, type: '4W', timestamp: new Date() };
+  }
+
+  // 2. Inventory Check
+  checkAvailability(vehicleType) {
+    const spots = this.inventory.filter(s => s.available);
+    this.log('DB', `Checked availability for ${vehicleType}. Found ${spots.length} spots.`);
+    return {
+      spots: spots.map(s => `${s.id} (L${s.level}-${s.section}) ₹${s.rate}/hr`),
+      count: spots.length
+    };
+  }
+
+  // 3. Reservation Creation
+  reserveSpot(spotId, durationHours, vehicleType) {
+    const spot = this.inventory.find(s => s.id === spotId);
+    if (!spot || !spot.available) {
+      this.log('ERROR', `Reservation failed: Spot ${spotId} unavailable`);
+      return { success: false, message: `Sorry, spot ${spotId} is no longer available.` };
+    }
+    
+    const totalAmount = spot.rate * durationHours;
+    const resId = `PB-${Date.now().toString(36).toUpperCase()}`;
+    
+    spot.available = false;
+    this.reservations.set(resId, { spotId, durationHours, amount: totalAmount });
+    this.log('DB', `Spot ${spotId} reserved for ${durationHours}h. Total: ₹${totalAmount}`);
+    
+    return { 
+      success: true, 
+      reservationId: resId, 
+      spotId, 
+      totalAmount, 
+      message: `Reserved ${spotId} for ${durationHours}h. Total: ₹${totalAmount}` 
+    };
+  }
+
+  // 4. Payment Link Generation
+  generatePaymentLink(reservationId, amount, phone) {
+    this.log('PAYMENT', `WhatsApp link generated for ${reservationId}. Amount: ₹${amount}`);
+    return {
+      platform: 'whatsapp',
+      link: `https://pay.parkbase.io/${reservationId}`,
+      message: `Pay ₹${amount} for Spot ${reservationId}. Reply PAY to confirm.`
+    };
+  }
+
+  // 5. Navigation Handoff
+  getNavigation(spotId) {
+    const spot = this.inventory.find(s => s.id === spotId);
+    if (!spot) return { error: 'Spot not found' };
+    this.log('NAV', `Google Maps link generated for ${spotId}`);
+    return {
+      destination: `Level ${spot.level}, Section ${spot.section}, Spot ${spot.id}`,
+      walkTime: '2 min',
+      mapsLink: `google.navigation:q=Parkbase+Lot+${this.lotId}+Spot+${spot.id}`
+    };
+  }
+
+  getLogs() { return this.logs.slice(0, 10); }
+}
+
+const backend = new ParkbaseBackend();
+
+// --- AGENT SETUP ---
 const AGENT = await (async () => {
   const name = process.env.AGENT || 'minimal'
   const known = storedAgentId(name)
   if (known) {
     try {
       const agent = await aai(`/agents/${known}`)
-      return { id: known, name: agent.name || 'Your agent' }
+      return { id: known, name: agent.name || 'Parkbase' }
     } catch (error) {
       console.error(`Could not load agent ${known}: ${error.message}`)
       process.exit(1)
@@ -37,776 +119,344 @@ const AGENT = await (async () => {
 
 console.log(`Agent: ${AGENT.id}`)
 
-// --- client ----------------------------------------------------------------
-// Stringified and served as /app.js.
+// --- CLIENT APP (PARKBASE DEMO UI) ---
 function clientApp() {
-const $ = (id) => document.getElementById(id)
-// The rate the API speaks. Both worklets resample, since a browser may
-// ignore the rate an AudioContext asks for.
-const WIRE_RATE = 24_000
-const AGENT = window.AGENT
+  const $ = (id) => document.getElementById(id)
+  const WIRE_RATE = 24_000
+  const AGENT = window.AGENT
 
-// Scratch buffers are reused: allocating on the audio thread causes glitches.
-const CAPTURE_WORKLET = `
-  class CaptureProcessor extends AudioWorkletProcessor {
-    constructor() {
-      super();
-      this._ratio = sampleRate / ${WIRE_RATE};
-      this._pos = 0;
-      this._prev = 0;
-      this._src = null;
-      this._out = null;
-    }
-    _toPcm(samples, len) {
-      const pcm = new Int16Array(len);
-      for (let i = 0; i < len; i++) {
-        const s = Math.max(-1, Math.min(1, samples[i]));
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-      return pcm;
-    }
-    process(inputs) {
-      const ch = inputs[0]?.[0];
-      if (!ch) return true;
-      if (this._ratio === 1) {
-        const pcm = this._toPcm(ch, ch.length);
-        this.port.postMessage(pcm.buffer, [pcm.buffer]);
-        return true;
-      }
-      const n = ch.length;
-      if (!this._src || this._src.length < n + 1) {
-        this._src = new Float32Array(n + 1);
-        this._out = new Float32Array(Math.ceil((n + 1) / this._ratio) + 2);
-      }
-      const src = this._src;
-      const out = this._out;
-      src[0] = this._prev;
-      src.set(ch, 1);
-      let outLen = 0;
-      let pos = this._pos;
-      while (pos < n) {
-        const i = Math.floor(pos);
-        const frac = pos - i;
-        out[outLen++] = src[i] + (src[i + 1] - src[i]) * frac;
-        pos += this._ratio;
-      }
-      this._pos = pos - n;
-      this._prev = ch[n - 1];
-      if (outLen) {
-        const pcm = this._toPcm(out, outLen);
-        this.port.postMessage(pcm.buffer, [pcm.buffer]);
-      }
-      return true;
-    }
+  // Audio Worklets (Unchanged from starter)
+  const CAPTURE_WORKLET = `
+    class CaptureProcessor extends AudioWorkletProcessor {
+      constructor() { super(); this._ratio = sampleRate / ${WIRE_RATE}; this._pos = 0; this._prev = 0; }
+      _toPcm(samples, len) { const pcm = new Int16Array(len); for(let i=0;i<len;i++){const s=Math.max(-1,Math.min(1,samples[i]));pcm[i]=s<0?s*0x8000:s*0x7fff;} return pcm; }
+      process(inputs) { const ch = inputs[0]?.[0]; if(!ch) return true; if(this._ratio===1){const pcm=this._toPcm(ch,ch.length);this.port.postMessage(pcm.buffer,[pcm.buffer]);return true;} const n=ch.length; if(!this._src||this._src.length<n+1){this._src=new Float32Array(n+1);this._out=new Float32Array(Math.ceil((n+1)/this._ratio)+2);} const src=this._src;const out=this._out;src[0]=this._prev;src.set(ch,1);let outLen=0;let pos=this._pos;while(pos<n){const i=Math.floor(pos);const frac=pos-i;out[outLen++]=src[i]+(src[i+1]-src[i])*frac;pos+=this._ratio;} this._pos=pos-n;this._prev=ch[n-1];if(outLen){const pcm=this._toPcm(out,outLen);this.port.postMessage(pcm.buffer,[pcm.buffer]);} return true; }
+    } registerProcessor('capture', CaptureProcessor);`
+
+  const PLAYBACK_WORKLET = `
+    class PlaybackProcessor extends AudioWorkletProcessor {
+      constructor() { super(); this._ring=new Float32Array(sampleRate*30);this._writePos=0;this._readPos=0;this._available=0;this._step=${WIRE_RATE}/sampleRate;this._rsPos=0;this._rsPrev=0;this._drained=false;this.port.onmessage=(e)=>{if(e.data==='stop'){this._writePos=this._readPos=this._available=0;this._rsPos=this._rsPrev=0;return;} const int16=new Int16Array(e.data);if(!int16.length)return;if(this._drained){this._rsPrev=0;this._rsPos=0;this._drained=false;} if(this._step===1){for(let i=0;i<int16.length;i++)this._push(int16[i]/32768);return;} const n=int16.length;let pos=this._rsPos;while(pos<n){const i=Math.floor(pos);const frac=pos-i;const a=i===0?this._rsPrev:int16[i-1]/32768;const b=int16[i]/32768;this._push(a+(b-a)*frac);pos+=this._step;} this._rsPos=pos-n;this._rsPrev=int16[n-1]/32768;}; }
+      _push(v) { if(this._available<this._ring.length){this._ring[this._writePos]=v;this._writePos=(this._writePos+1)%this._ring.length;this._available++;} }
+      process(inputs, outputs) { const output=outputs[0];const out=output[0];const cap=this._ring.length;for(let i=0;i<out.length;i++){if(this._available>0){out[i]=this._ring[this._readPos];this._readPos=(this._readPos+1)%cap;this._available--;}else{out[i]=0;this._drained=true;}} for(let ch=1;ch<output.length;ch++)output[ch].set(out);return true; }
+    } registerProcessor('playback', PlaybackProcessor);`
+
+  const blobUrl = (code) => URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))
+  let ws, captureCtx, playbackCtx, playback, mic, callStart, timer
+
+  async function listMics() {
+    if (!navigator.mediaDevices?.enumerateDevices) return
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    const inputs = devices.filter(d => d.kind === 'audioinput').filter(d => d.deviceId !== 'default' && d.deviceId !== 'communications')
+    const select = $('mic'); const chosen = select.value; select.replaceChildren()
+    const auto = document.createElement('option'); auto.value = ''; auto.textContent = 'Default microphone'; select.append(auto)
+    inputs.forEach((device, i) => { const opt = document.createElement('option'); opt.value = device.deviceId; opt.textContent = device.label || `Mic ${i+1}`; select.append(opt) })
+    if (chosen && inputs.some(d => d.deviceId === chosen)) select.value = chosen
   }
-  registerProcessor('capture', CaptureProcessor);
-`
+  listMics(); navigator.mediaDevices?.addEventListener?.('devicechange', listMics)
 
-// A ring buffer rather than one AudioBufferSource per chunk, which drifts and
-// clicks under jitter. Posting 'stop' empties it for barge-in.
-const PLAYBACK_WORKLET = `
-  class PlaybackProcessor extends AudioWorkletProcessor {
-    constructor() {
-      super();
-      this._ring = new Float32Array(sampleRate * 30);
-      this._writePos = 0;
-      this._readPos = 0;
-      this._available = 0;
-      this._step = ${WIRE_RATE} / sampleRate;
-      this._rsPos = 0;
-      this._rsPrev = 0;
-      // After a gap the speaker sits at zero, so interpolating from the
-      // pre-gap _rsPrev would click. Reset it instead.
-      this._drained = false;
-      this.port.onmessage = (e) => {
-        if (e.data === 'stop') {
-          this._writePos = this._readPos = this._available = 0;
-          this._rsPos = this._rsPrev = 0;
-          return;
-        }
-        const int16 = new Int16Array(e.data);
-        // int16[-1] would make _rsPrev NaN, silencing the ring for good.
-        if (!int16.length) return;
-        if (this._drained) {
-          this._rsPrev = 0;
-          this._rsPos = 0;
-          this._drained = false;
-        }
-        if (this._step === 1) {
-          for (let i = 0; i < int16.length; i++) this._push(int16[i] / 32768);
-          return;
-        }
-        const n = int16.length;
-        let pos = this._rsPos;
-        while (pos < n) {
-          const i = Math.floor(pos);
-          const frac = pos - i;
-          const a = i === 0 ? this._rsPrev : int16[i - 1] / 32768;
-          const b = int16[i] / 32768;
-          this._push(a + (b - a) * frac);
-          pos += this._step;
-        }
-        this._rsPos = pos - n;
-        this._rsPrev = int16[n - 1] / 32768;
-      };
-    }
-    _push(v) {
-      if (this._available < this._ring.length) {
-        this._ring[this._writePos] = v;
-        this._writePos = (this._writePos + 1) % this._ring.length;
-        this._available++;
+  $('btn').onclick = () => (ws?.readyState <= 1 ? stop() : start())
+
+  async function addWorklet(ctx, code, name) {
+    const url = blobUrl(code); try { await ctx.audioWorklet.addModule(url) } finally { URL.revokeObjectURL(url) }
+    return new AudioWorkletNode(ctx, name)
+  }
+
+  async function start() {
+    $('btn').disabled = true; $('mic').disabled = true; setStatus('connecting')
+    try {
+      const res = await fetch('/token'); if (!res.ok) { setStatus('error', 'Token failed'); reset(); return }
+      const { token } = await res.json()
+      captureCtx = new AudioContext({ sampleRate: WIRE_RATE }); playbackCtx = new AudioContext({ sampleRate: WIRE_RATE })
+      await Promise.all([captureCtx.resume(), playbackCtx.resume()])
+      playback = await addWorklet(playbackCtx, PLAYBACK_WORKLET, 'playback'); playback.connect(playbackCtx.destination)
+      const deviceId = $('mic').value
+      mic = await navigator.mediaDevices.getUserMedia({ audio: { ...(deviceId ? { deviceId } : {}), channelCount: 1, sampleRate: 24000, echoCancellation: true, noiseSuppression: true, autoGainControl: false, latency: 0 } })
+      listMics()
+      const capture = await addWorklet(captureCtx, CAPTURE_WORKLET, 'capture'); captureCtx.createMediaStreamSource(mic).connect(capture)
+      const url = new URL('wss://agents.assemblyai.com/v1/ws'); url.searchParams.set('token', token)
+      ws = new WebSocket(url); let ready = false
+      
+      capture.port.onmessage = ({ data }) => {
+        if (!ready || ws.readyState !== 1) return
+        const bytes = new Uint8Array(data); let binary = ''
+        for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+        ws.send(JSON.stringify({ type: 'input.audio', audio: btoa(binary) }))
       }
-    }
-    process(inputs, outputs) {
-      const output = outputs[0];
-      const out = output[0];
-      const cap = this._ring.length;
-      for (let i = 0; i < out.length; i++) {
-        if (this._available > 0) {
-          out[i] = this._ring[this._readPos];
-          this._readPos = (this._readPos + 1) % cap;
-          this._available--;
-        } else {
-          out[i] = 0;
-          this._drained = true;
+
+      ws.onopen = () => { ws.send(JSON.stringify({ type: 'session.update', session: { agent_id: AGENT.id } })); }
+      
+      ws.onmessage = ({ data }) => {
+        const msg = JSON.parse(data)
+        switch (msg.type) {
+          case 'session.ready': ready = true; callStart = Date.now(); timer = setInterval(tick, 1000); tick(); setStatus('listening'); $('btn').disabled = false; $('btn').textContent = 'End Call'; break
+          case 'input.speech.started': playback?.port.postMessage('stop'); setStatus('listening'); break
+          case 'reply.started': setStatus('speaking'); break
+          case 'reply.audio': { try { const raw = atob(msg.data); const bytes = new Uint8Array(raw.length); for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i); playback?.port.postMessage(bytes.buffer, [bytes.buffer]); } catch(e) { console.error('Audio decode error:', e); } break; }
+          case 'reply.done': setStatus('listening'); if (msg.status === 'interrupted') playback?.port.postMessage('stop'); break
+          case 'transcript.user.delta': partial('you', msg.text); break
+          case 'transcript.agent.delta': if (msg.reply_id && msg.reply_id === printedReply) break; if (msg.reply_id !== liveReply) { liveReply = msg.reply_id; dropPartial('agent'); } partial('agent', appendDelta(partialText.agent || '', msg.delta)); break
+          case 'transcript.user': addLine('you', msg.text); break
+          case 'transcript.agent': printedReply = msg.reply_id ?? printedReply; addLine('agent', msg.text); break
+          case 'tool.call': 
+            addLine('tool', `${msg.name}(${JSON.stringify(msg.arguments ?? {})})`); 
+            // TRIGGER BACKEND SIMULATION HERE
+            handleToolCall(msg.name, msg.arguments);
+            break
+          case 'session.ended': ws.close(); break
+          case 'session.error': setStatus('error', msg.message); break
         }
       }
-      // Mono source, stereo sink.
-      for (let ch = 1; ch < output.length; ch++) output[ch].set(out);
-      return true;
-    }
+      ws.onclose = () => { setStatus('idle'); reset() }; ws.onerror = () => { setStatus('error', 'Connection failed'); reset() }
+    } catch (error) { setStatus('error', error.message); reset() }
   }
-  registerProcessor('playback', PlaybackProcessor);
-`
 
-const blobUrl = (code) =>
-  URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))
-
-let ws, captureCtx, playbackCtx, playback, mic, callStart, timer
-
-// --- microphones ---
-// Labels stay empty until mic permission is granted, so this runs again after
-// getUserMedia.
-async function listMics() {
-  if (!navigator.mediaDevices?.enumerateDevices) return
-  const devices = await navigator.mediaDevices.enumerateDevices()
-  const inputs = devices
-    .filter((device) => device.kind === 'audioinput')
-    // Chrome's synthetic entries alias a real device and duplicate it.
-    .filter((device) => device.deviceId !== 'default' && device.deviceId !== 'communications')
-  const select = $('mic')
-  const chosen = select.value
-  select.replaceChildren()
-  const auto = document.createElement('option')
-  auto.value = ''
-  auto.textContent = 'Default microphone'
-  select.append(auto)
-  inputs.forEach((device, i) => {
-    const option = document.createElement('option')
-    option.value = device.deviceId
-    option.textContent = device.label || `Microphone ${i + 1}`
-    select.append(option)
-  })
-  if (chosen && inputs.some((device) => device.deviceId === chosen)) select.value = chosen
-}
-listMics()
-navigator.mediaDevices?.addEventListener?.('devicechange', listMics)
-
-$('btn').onclick = () => (ws?.readyState <= 1 ? stop() : start())
-$('log-toggle').onclick = () => {
-  const hidden = document.body.classList.toggle('no-side')
-  $('log-toggle').textContent = hidden ? 'Show' : 'Hide'
-}
-
-// --- side pane tabs ---
-let agentLoaded = false
-
-function showTab(name) {
-  for (const tab of ['events', 'agent']) {
-    $('tab-' + tab).classList.toggle('on', tab === name)
-    $(tab + '-body').hidden = tab !== name
-  }
-  if (name === 'agent' && !agentLoaded) {
-    agentLoaded = true
-    fetch('/agent')
-      .then((res) => res.json())
-      .then((agent) => {
-        $('agent-body').replaceChildren()
-        const pre = document.createElement('pre')
-        pre.textContent = JSON.stringify(agent, null, 2)
-        $('agent-body').append(pre)
-      })
-      .catch(() => {
-        agentLoaded = false
-        $('agent-body').textContent = 'Could not load the agent.'
-      })
-  }
-}
-$('tab-events').onclick = () => showTab('events')
-$('tab-agent').onclick = () => showTab('agent')
-
-async function addWorklet(ctx, code, name) {
-  const url = blobUrl(code)
-  try {
-    await ctx.audioWorklet.addModule(url)
-  } finally {
-    URL.revokeObjectURL(url)
-  }
-  return new AudioWorkletNode(ctx, name)
-}
-
-async function start() {
-  $('btn').disabled = true
-  $('mic').disabled = true
-  setStatus('connecting')
-
-  try {
-    // The API key never reaches the page; this token expires in 60 seconds.
-    const res = await fetch('/token')
-    if (!res.ok) {
-      setStatus('error', 'could not mint a token, check the API key')
-      reset()
-      return
-    }
-    const { token } = await res.json()
-
-    // Two contexts, created in the click handler so Safari starts them.
-    captureCtx = new AudioContext({ sampleRate: WIRE_RATE })
-    playbackCtx = new AudioContext({ sampleRate: WIRE_RATE })
-    await Promise.all([captureCtx.resume(), playbackCtx.resume()])
-
-    playback = await addWorklet(playbackCtx, PLAYBACK_WORKLET, 'playback')
-    playback.connect(playbackCtx.destination)
-
-    const deviceId = $('mic').value
-    mic = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        // A preference, not `exact`: an unplugged device falls back.
-        ...(deviceId ? { deviceId } : {}),
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    })
-    listMics()
-    const capture = await addWorklet(captureCtx, CAPTURE_WORKLET, 'capture')
-    captureCtx.createMediaStreamSource(mic).connect(capture)
-
-    const url = new URL('wss://agents.assemblyai.com/v1/ws')
-    url.searchParams.set('token', token)
-    ws = new WebSocket(url)
-    let ready = false
-
-    // The API takes base64 inside JSON, not binary frames.
-    capture.port.onmessage = ({ data }) => {
-      if (!ready || ws.readyState !== 1) return
-      const bytes = new Uint8Array(data)
-      let binary = ''
-      for (let i = 0; i < bytes.length; i += 0x8000) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-      }
-      ws.send(JSON.stringify({ type: 'input.audio', audio: btoa(binary) }))
-      logEvent('up', 'input.audio')
-    }
-
-    // Everything about the agent lives server-side; the session just names it.
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'session.update', session: { agent_id: AGENT.id } }))
-      logEvent('up', 'session.update', AGENT.id)
-    }
-
-    ws.onmessage = ({ data }) => {
-      const msg = JSON.parse(data)
-      switch (msg.type) {
-        case 'session.ready':
-          ready = true
-          callStart = Date.now()
-          timer = setInterval(tick, 1000)
-          tick()
-          setStatus('listening')
-          $('btn').disabled = false
-          $('btn').textContent = 'End call'
-          $('btn').classList.add('live')
-          logEvent('down', msg.type, msg.session_id)
-          break
-
-        case 'input.speech.started':
-          // Barge-in: empty the ring buffer so the agent stops mid-word.
-          playback?.port.postMessage('stop')
-          setStatus('listening')
-          logEvent('down', msg.type)
-          break
-
-        case 'reply.started':
-          setStatus('speaking')
-          logEvent('down', msg.type)
-          break
-
-        case 'reply.audio': {
-          const raw = atob(msg.data)
-          const bytes = new Uint8Array(raw.length)
-          for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i)
-          playback?.port.postMessage(bytes.buffer, [bytes.buffer])
-          logEvent('down', msg.type)
-          break
-        }
-
-        case 'reply.done':
-          setStatus('listening')
-          if (msg.status === 'interrupted') playback?.port.postMessage('stop')
-          logEvent('down', msg.type, msg.status)
-          break
-
-        // text is the full transcript so far, so it replaces.
-        case 'transcript.user.delta':
-          partial('you', msg.text)
-          logEvent('down', msg.type, msg.text)
-          break
-
-        // delta is the next word only, so it appends.
-        case 'transcript.agent.delta':
-          logEvent('down', msg.type, msg.delta)
-          if (msg.reply_id && msg.reply_id === printedReply) break
-          if (msg.reply_id !== liveReply) {
-            liveReply = msg.reply_id
-            dropPartial('agent')
+  // --- BACKEND SIMULATION HANDLER ---
+  function handleToolCall(toolName, args) {
+    setTimeout(() => {
+      let logMsg = '';
+      switch(toolName) {
+        case 'check_parking_availability':
+          const avail = backend.checkAvailability(args.vehicle_type);
+          logMsg = backend.logs[0];
+          break;
+        case 'reserve_spot':
+          const res = backend.reserveSpot(args.spot_id, args.duration_hours, args.vehicle_type);
+          if(res.success) {
+            // Trigger WhatsApp simulation after 2s
+            setTimeout(() => showWhatsAppMessage(res.reservationId, res.totalAmount), 2000);
           }
-          partial('agent', appendDelta(partialText.agent || '', msg.delta))
-          break
-
-        case 'transcript.user':
-          addLine('you', msg.text)
-          logEvent('down', msg.type, msg.text)
-          break
-
-        case 'transcript.agent':
-          printedReply = msg.reply_id ?? printedReply
-          addLine('agent', msg.text)
-          logEvent('down', msg.type, msg.text)
-          break
-
-        case 'tool.call': {
-          // http tools run on AssemblyAI's side; no result comes back here.
-          const args = JSON.stringify(msg.arguments ?? {})
-          addLine('tool', `${msg.name}(${args})`)
-          logEvent('down', msg.type, `${msg.name} ${args}`)
-          break
-        }
-
-        case 'session.ended':
-          logEvent('down', msg.type)
-          ws.close()
-          break
-
-        case 'session.error':
-          setStatus('error', msg.message)
-          logEvent('down', msg.type, `${msg.code}: ${msg.message}`)
-          break
-
-        default:
-          logEvent('down', msg.type)
+          logMsg = backend.logs[0];
+          break;
+        case 'get_navigation':
+          const nav = backend.getNavigation(args.spot_id);
+          if(nav.mapsLink) showNavigationButton(nav.mapsLink, nav.destination);
+          logMsg = backend.logs[0];
+          break;
       }
-    }
-
-    ws.onclose = () => { setStatus('idle'); reset() }
-    ws.onerror = () => { setStatus('error', 'connection failed'); reset() }
-  } catch (error) {
-    setStatus('error', error.message)
-    reset()
+      if(logMsg) addSystemLog(logMsg);
+    }, 500); // Simulate network latency
   }
-}
 
-function stop() {
-  // Close cleanly so the session record ends, falling back to the socket.
-  if (ws?.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'session.end' }))
-    logEvent('up', 'session.end')
-    const socket = ws
-    setTimeout(() => { if (socket.readyState === 1) socket.close() }, 3000)
-  } else {
-    ws?.close()
+  function showWhatsAppMessage(resId, amount) {
+    const chatArea = $('chat-area');
+    const waMsg = document.createElement('div');
+    waMsg.className = 'msg whatsapp';
+    waMsg.innerHTML = `
+      <div class="who-label">WhatsApp</div>
+      <div style="background:#DCF8C6;padding:10px;border-radius:12px;font-size:0.8rem;color:#1a1a1a;">
+        ✅ Reservation Confirmed!<br>
+        Spot: ${resId}<br>
+        Amount: ₹${amount}<br><br>
+        <button onclick="simulatePayment('${resId}')" style="background:#25D366;color:white;border:none;padding:6px 12px;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:5px;">PAY NOW</button>
+      </div>
+    `;
+    chatArea.appendChild(waMsg);
+    scroll(chatArea);
+    addSystemLog(`[PAYMENT] WhatsApp message sent for ${resId}`);
   }
-  playback?.port.postMessage('stop')
-  mic?.getTracks().forEach((track) => track.stop())
-  captureCtx?.close()
-  playbackCtx?.close()
-  captureCtx = playbackCtx = playback = mic = null
-  reset()
-  setStatus('idle')
-}
 
-function reset() {
-  clearInterval(timer)
-  clearPartials()
-  open.forEach((run) => paint(run, true))
-  open.clear()
-  $('btn').disabled = false
-  $('mic').disabled = false
-  $('btn').textContent = 'Start call'
-  $('btn').classList.remove('live')
-}
+  window.simulatePayment = function(resId) {
+    addSystemLog(`[PAYMENT] Payment confirmed for ${resId}`);
+    addLine('agent', `Payment received! I'm generating your navigation instructions now.`);
+    // Trigger navigation tool call simulation
+    setTimeout(() => {
+      const nav = backend.getNavigation('C2'); // Default to C2 for demo
+      if(nav.mapsLink) showNavigationButton(nav.mapsLink, nav.destination);
+    }, 1000);
+  };
 
-function setStatus(state, detail) {
-  $('status').className = 'status ' + state
-  $('status-text').textContent = detail || state
-}
-
-// $4.50 an hour, the list price at assemblyai.com/pricing. Billing is per
-// session minute, so the running figure is an estimate, not an invoice.
-const COST_PER_SECOND = 4.5 / 3600
-
-function tick() {
-  const seconds = Math.floor((Date.now() - callStart) / 1000)
-  $('elapsed').textContent =
-    Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0')
-  $('cost').textContent = '$' + (seconds * COST_PER_SECOND).toFixed(3)
-}
-
-// --- transcript ---
-const partialText = {}
-const partialEl = {}
-// The full reply arrives once its audio has been sent, which beats the audio
-// playing out, so deltas keep coming after the line is printed. printedReply
-// stops them rebuilding the same sentence underneath it.
-let liveReply = null
-let printedReply = null
-
-// Deltas arrive with a leading space sometimes and without it other times, so
-// add one only when neither side has one and the delta is not punctuation.
-const ATTACHES_LEFT = /^[.,!?;:%°)\]}…'"’”]/
-const NO_SPACE_AFTER = /[([{$\-\/'"‘“]$/
-
-function appendDelta(text, delta) {
-  if (!delta) return text
-  if (!text) return delta
-  if (/^\s/.test(delta) || /\s$/.test(text)) return text + delta
-  if (ATTACHES_LEFT.test(delta) || NO_SPACE_AFTER.test(text)) return text + delta
-  return text + ' ' + delta
-}
-
-function dropPartial(who) {
-  partialEl[who]?.remove()
-  delete partialEl[who]
-  delete partialText[who]
-}
-
-function transcriptLine(who, text, cls) {
-  const line = document.createElement('div')
-  line.className = 'line ' + who + (cls ? ' ' + cls : '')
-  const label = document.createElement('span')
-  label.className = 'who'
-  label.textContent = who === 'agent' ? AGENT.name : who
-  const body = document.createElement('span')
-  body.className = 'said'
-  body.textContent = text
-  line.append(label, body)
-  return line
-}
-
-function clearEmpty(el) {
-  const empty = el.querySelector('.empty')
-  if (empty) empty.remove()
-}
-
-function scroll(el) {
-  el.scrollTop = el.scrollHeight
-}
-
-function partial(who, text) {
-  clearEmpty($('transcript'))
-  partialText[who] = text
-  if (partialEl[who]) {
-    partialEl[who].querySelector('.said').textContent = text
-  } else {
-    partialEl[who] = transcriptLine(who, text, 'partial')
-    $('transcript').append(partialEl[who])
+  function showNavigationButton(link, dest) {
+    const chatArea = $('chat-area');
+    const navMsg = document.createElement('div');
+    navMsg.className = 'msg agent';
+    navMsg.innerHTML = `
+      <div class="who-label">Parkbase</div>
+      📍 ${dest}<br>
+      <a href="${link}" target="_blank" style="display:inline-block;margin-top:8px;background:#2563eb;color:white;padding:8px 16px;border-radius:8px;text-decoration:none;font-size:0.8rem;font-weight:bold;">Open in Google Maps</a>
+    `;
+    chatArea.appendChild(navMsg);
+    scroll(chatArea);
   }
-  scroll($('transcript'))
-}
 
-function addLine(who, text) {
-  clearEmpty($('transcript'))
-  dropPartial(who)
-  $('transcript').append(transcriptLine(who, text))
-  scroll($('transcript'))
-}
-
-function clearPartials() {
-  for (const who of Object.keys(partialEl)) dropPartial(who)
-  liveReply = printedReply = null
-}
-
-// --- event log ---
-// Audio frames arrive ~190 times a second each way, so these types hold a row
-// open and count into it. Both streams run at once, hence a row per key.
-const COALESCE = new Set([
-  'input.audio',
-  'reply.audio',
-  'transcript.user.delta',
-  'transcript.agent.delta',
-])
-const open = new Map()
-
-function eventRow(direction, type, detail) {
-  const row = document.createElement('div')
-  row.className = 'event ' + direction
-  const at = document.createElement('span')
-  at.className = 'at'
-  at.textContent = (callStart ? (Date.now() - callStart) / 1000 : 0).toFixed(1) + 's'
-  const arrow = document.createElement('span')
-  arrow.className = 'dir'
-  arrow.textContent = direction === 'up' ? '↑' : '↓'
-  const name = document.createElement('span')
-  name.className = 'type'
-  name.textContent = type
-  const count = document.createElement('span')
-  count.className = 'count'
-  const info = document.createElement('span')
-  info.className = 'detail'
-  if (detail) info.textContent = detail
-  row.append(at, arrow, name, count, info)
-  return row
-}
-
-// Ten repaints a second, plus one when the run closes.
-function paint(live, final) {
-  const now = performance.now()
-  if (!final && now - live.painted < 100) return
-  live.painted = now
-  live.row.querySelector('.count').textContent = live.count > 1 ? '×' + live.count : ''
-  if (live.detail) live.row.querySelector('.detail').textContent = live.detail
-}
-
-function logEvent(direction, type, detail) {
-  const log = $('events-body')
-  clearEmpty(log)
-  const key = direction + ' ' + type
-  const live = open.get(key)
-  if (live) {
-    live.count += 1
-    if (detail) live.detail = detail
-    paint(live)
-    return
+  function addSystemLog(msg) {
+    const logsEl = $('system-logs');
+    const logEntry = document.createElement('div');
+    logEntry.style.cssText = 'font-family:monospace;font-size:0.7rem;color:#64748b;padding:2px 0;border-bottom:1px solid #f1f5f9;';
+    logEntry.textContent = msg;
+    logsEl.prepend(logEntry);
+    if(logsEl.children.length > 10) logsEl.lastChild.remove();
   }
-  // A real event closes the open runs, so the next burst starts a new row.
-  if (!COALESCE.has(type)) {
-    open.forEach((run) => paint(run, true))
-    open.clear()
+
+  function stop() {
+    if (ws?.readyState === 1) { ws.send(JSON.stringify({ type: 'session.end' })); setTimeout(() => { if (ws?.readyState === 1) ws.close() }, 3000) } else { ws?.close() }
+    playback?.port.postMessage('stop'); mic?.getTracks().forEach(t => t.stop()); captureCtx?.close(); playbackCtx?.close()
+    captureCtx = playbackCtx = playback = mic = null; reset(); setStatus('idle')
   }
-  // Only follow the tail if the reader is there.
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40
-  const row = eventRow(direction, type, detail)
-  log.append(row)
-  while (log.children.length > 400) log.firstChild.remove()
-  if (COALESCE.has(type)) open.set(key, { row, count: 1, detail, painted: 0 })
-  if (atBottom) scroll(log)
-}
+
+  function reset() { clearInterval(timer); clearPartials(); $('btn').disabled = false; $('mic').disabled = false; $('btn').textContent = 'Start Call' }
+  function setStatus(state, detail) { $('status').className = 'status ' + state; $('status-text').textContent = detail || state }
+  
+  const COST_PER_SECOND = 4.5 / 3600
+  function tick() { const seconds = Math.floor((Date.now() - callStart) / 1000); $('elapsed').textContent = Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0'); $('cost').textContent = '$' + (seconds * COST_PER_SECOND).toFixed(3) }
+
+  // Transcript Handling
+  const partialText = {}; const partialEl = {}; let liveReply = null; let printedReply = null
+  const ATTACHES_LEFT = /^[.,!?;:%°)\]}…'"’”]/; const NO_SPACE_AFTER = /[([{$\-\/'"‘“]$/
+  function appendDelta(text, delta) { if (!delta) return text; if (!text) return delta; if (/^\s/.test(delta) || /\s$/.test(text)) return text + delta; if (ATTACHES_LEFT.test(delta) || NO_SPACE_AFTER.test(text)) return text + delta; return text + ' ' + delta }
+  function dropPartial(who) { partialEl[who]?.remove(); delete partialEl[who]; delete partialText[who] }
+  function transcriptLine(who, text) { const line = document.createElement('div'); line.className = 'line ' + who; const label = document.createElement('span'); label.className = 'who'; label.textContent = who === 'agent' ? 'Parkbase' : 'You'; const body = document.createElement('span'); body.className = 'said'; body.textContent = text; line.append(label, body); return line }
+  function scroll(el) { el.scrollTop = el.scrollHeight }
+  function partial(who, text) { partialText[who] = text; if (partialEl[who]) { partialEl[who].querySelector('.said').textContent = text } else { partialEl[who] = transcriptLine(who, text); $('chat-area').append(partialEl[who]) } scroll($('chat-area')) }
+  function addLine(who, text) { dropPartial(who); $('chat-area').append(transcriptLine(who, text)); scroll($('chat-area')) }
+  function clearPartials() { for (const who of Object.keys(partialEl)) dropPartial(who); liveReply = printedReply = null }
 }
 
-// --- page ------------------------------------------------------------------
+// --- PARKBASE DEMO LAYOUT HTML ---
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${AGENT.name}</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parkbase MVP</title>
 <style>
-  /* Tokens taken from assemblyai.com. The three typefaces are licensed and
-     not bundled here, so each falls back the same way the site's own stack
-     does: Georgia for display, system-ui for body, JetBrains Mono for mono. */
-  :root {
-    --page-bg: #fdfcf8;
-    --surface: #fff;
-    --surface-alt: #f5f3eb;
-    --border: #dad7cb;
-    --border-strong: #c7c3b2;
-    --text: #4a4945;
-    --text-dark: #1d1b16;
-    --text-muted: #777673;
-    --text-faint: #a5a4a2;
-    --cobolt-500: #3923c7;
-    --cobolt-300: #887bdd;
-    --cobolt-100: #d7d3f4;
-    --green-500: #01762f;
-    --error: #f04438;
-    --radius-sm: 4px;
-    --radius-lg: 12px;
-    --font-display: "Oceanic Text", Georgia, serif;
-    --font-body: "UN 11ST", system-ui, -apple-system, sans-serif;
-    --font-mono: "Modern Gothic Mono", "JetBrains Mono", ui-monospace, monospace;
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; }
-  body {
-    font-family: var(--font-body); font-size: 16px; line-height: 1.3;
-    color: var(--text); background: var(--page-bg); display: flex;
-    flex-direction: column; align-items: center; padding: 24px 20px 20px;
-  }
-  main { width: 100%; max-width: 1088px; flex: 1; display: flex;
-         flex-direction: column; min-height: 0; gap: 16px; }
-
-  /* .eyebrow on the site: mono, 12px, uppercase, 1.2px tracking. */
-  .eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 1.2px;
-             text-transform: uppercase; font-feature-settings: "ss09" 1; }
-
-  header { display: flex; align-items: center; gap: 16px;
-           padding-bottom: 16px; border-bottom: 1px solid var(--border); }
-  h1 { font-family: var(--font-display); font-size: 24px; font-weight: 400;
-       letter-spacing: -1.2px; line-height: 1; color: var(--text-dark);
-       margin-right: auto; }
-  .status { display: flex; align-items: center; gap: 8px; color: var(--text-muted); }
-  .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
-                    background: currentColor; flex-shrink: 0; }
-  .status.listening { color: var(--green-500); }
-  .status.speaking { color: var(--cobolt-500); }
-  .status.error { color: var(--error); text-transform: none; letter-spacing: 0;
-                  font-family: var(--font-body); font-size: 14px; }
-  .status.listening::before, .status.speaking::before {
-    animation: pulse 1.6s ease-in-out infinite; }
-  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
-  .meter { display: flex; gap: 10px; font-family: var(--font-mono); font-size: 12px;
-           color: var(--text-faint); }
-  #elapsed { min-width: 34px; text-align: right; }
-  #cost { min-width: 48px; text-align: right; }
-
-  .panes { flex: 1; min-height: 0; display: grid; gap: 16px;
-           grid-template-columns: 1fr 360px; }
-  body.no-side .panes { grid-template-columns: 1fr; }
-  body.no-side #side { display: none; }
-  [hidden] { display: none !important; }
-  @media (max-width: 880px) {
-    .panes { grid-template-columns: 1fr; grid-template-rows: 1fr 176px; }
-    body.no-side .panes { grid-template-rows: 1fr; }
-  }
-
-  .pane { display: flex; flex-direction: column; min-height: 0;
-          background: var(--surface); border: 1px solid var(--border);
-          border-radius: var(--radius-lg); overflow: hidden; }
-  .pane-head { display: flex; align-items: center; justify-content: space-between;
-               gap: 16px; padding: 10px 16px; background: var(--surface-alt);
-               border-bottom: 1px solid var(--border); color: var(--text-muted); }
-  .pane-body { flex: 1; overflow-y: auto; padding: 16px; }
-  .empty { color: var(--text-faint); font-size: 14px; line-height: 1.4; }
-
-  #transcript { display: flex; flex-direction: column; gap: 12px; }
-  .line { display: flex; gap: 12px; font-size: 16px; line-height: 1.4; }
-  .who { color: var(--text-faint); padding-top: 3px; flex-shrink: 0; width: 88px;
-         overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .line.agent .said { color: var(--text-dark); }
-  .line.partial .said { color: var(--text-muted); }
-  .line.tool { font-family: var(--font-mono); font-size: 13px;
-               color: var(--cobolt-500); }
-  .line.tool .said { word-break: break-all; }
-
-  #events-body { font-family: var(--font-mono); font-size: 12px; line-height: 1.8; }
-  .event { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; }
-  .event .at { color: var(--text-faint); min-width: 44px; text-align: right;
-               flex-shrink: 0; }
-  .event .dir, .event .count { color: var(--text-faint); flex-shrink: 0; }
-  .event .count:empty, .event .detail:empty { display: none; }
-  .event .type { flex-shrink: 0; color: var(--text-dark); }
-  .event.up .type { color: var(--text-muted); }
-  .event .detail { color: var(--text-faint); overflow: hidden; white-space: nowrap;
-                   text-overflow: ellipsis; }
-
-  .pane-foot { display: flex; gap: 8px; align-items: center; padding: 12px 16px;
-               background: var(--surface-alt); border-top: 1px solid var(--border); }
-  /* .cta-primary on the site: cobolt fill, mono uppercase 14px, 1.4px
-     tracking, 40px tall, 4px radius, lightening on hover. */
-  button { height: 40px; padding: 0 24px; margin-left: auto; border: none;
-           border-radius: var(--radius-sm); background: var(--cobolt-500);
-           color: #fff; font-family: var(--font-mono); font-size: 14px;
-           letter-spacing: 1.4px; text-transform: uppercase; white-space: nowrap;
-           cursor: pointer; transition: background-color .2s; }
-  button:hover:not(:disabled) { background: var(--cobolt-300); }
-  button:disabled { opacity: .55; cursor: default; }
-  button.live { background: var(--error); }
-  button.live:hover { background: #f4695f; }
-  select { flex: 0 1 220px; min-width: 0; height: 40px; padding: 0 8px;
-           font-family: var(--font-body); font-size: 13px; color: var(--text-muted);
-           background: var(--surface); border: 1px solid var(--border);
-           border-radius: var(--radius-sm); }
-  select:disabled { color: var(--text-faint); }
-  /* Text button, sized to sit inside the pane header. */
-  .ghost { height: auto; margin-left: 0; padding: 0; background: transparent;
-           color: var(--text-faint); font-size: 12px; letter-spacing: 1.2px; }
-  .ghost:hover:not(:disabled) { background: transparent; color: var(--cobolt-500); }
-  .tabs { display: flex; gap: 16px; }
-  .tab.on { color: var(--text-dark); }
-
-  /* Read-only view of the agent as the API stored it. */
-  #agent-body pre { font-family: var(--font-mono); font-size: 12px;
-                    line-height: 1.6; color: var(--text); white-space: pre-wrap;
-                    word-break: break-word; }
+  :root { --primary: #2563eb; --bg: #f8fafc; --surface: #ffffff; --text: #1e293b; --border: #e2e8f0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+  body { background: var(--bg); color: var(--text); height: 100vh; display: flex; align-items: center; justify-content: center; gap: 4rem; padding: 2rem; }
+  
+  /* LEFT PANEL: CONTROLS & LOGS */
+  .controls-panel { width: 400px; background: var(--surface); border-radius: 16px; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.1); border: 1px solid var(--border); overflow: hidden; display:flex; flex-direction:column; max-height:80vh; }
+  .panel-header { padding: 1.5rem; border-bottom: 1px solid var(--border); background: #f1f5f9; }
+  .panel-header h2 { font-size: 1.25rem; font-weight: 700; color: #0f172a; }
+  .panel-header p { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .panel-body { padding: 1.5rem; flex:1; overflow-y:auto; display: flex; flex-direction: column; gap: 1.5rem; }
+  .control-group h3 { font-size: 0.75rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 0.75rem; letter-spacing: 0.05em; }
+  .btn-primary { width: 100%; padding: 0.75rem; background: var(--primary); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .btn-primary:hover { background: #1d4ed8; }
+  .btn-outline { width: 100%; padding: 0.75rem; background: transparent; border: 1px solid var(--border); color: #64748b; border-radius: 8px; font-weight: 500; cursor: pointer; margin-top: 0.5rem; }
+  .btn-outline:hover { background: #f8fafc; color: var(--text); }
+  .vehicle-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
+  .vehicle-btn { padding: 0.5rem; border: 1px solid var(--border); background: white; border-radius: 6px; font-size: 0.875rem; cursor: pointer; }
+  .vehicle-btn.active { background: var(--primary); color: white; border-color: var(--primary); }
+  
+  /* SYSTEM LOGS */
+  .system-logs-container { margin-top:auto; border-top:1px solid var(--border); padding-top:1rem; }
+  .system-logs-container h3 { font-size: 0.75rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 0.5rem; letter-spacing: 0.05em; }
+  #system-logs { max-height:150px; overflow-y:auto; font-family:monospace; font-size:0.7rem; }
+  
+  /* RIGHT PANEL: PHONE MOCKUP */
+  .phone-wrapper { position: relative; }
+  .phone-frame { width: 320px; height: 650px; background: #1e293b; border-radius: 40px; padding: 12px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25); border: 4px solid #0f172a; position: relative; }
+  .phone-notch { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 120px; height: 24px; background: #0f172a; border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; z-index: 10; }
+  .phone-screen { width: 100%; height: 100%; background: white; border-radius: 32px; overflow: hidden; display: flex; flex-direction: column; position: relative; }
+  .app-header { padding: 2rem 1.5rem 1rem; text-align: center; border-bottom: 1px solid #f1f5f9; }
+  .app-header h1 { font-size: 1.25rem; font-weight: 800; letter-spacing: -0.025em; }
+  .app-header span { font-size: 0.625rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em; }
+  
+  /* CHAT AREA INSIDE PHONE */
+  #chat-area { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; background: #f8fafc; }
+  .msg { max-width: 85%; padding: 0.75rem 1rem; border-radius: 16px; font-size: 0.875rem; line-height: 1.4; animation: slideUp 0.3s ease-out; }
+  @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  .msg.agent { background: white; border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 4px; color: #334155; }
+  .msg.you { background: var(--primary); color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
+  .msg.tool { background: #fef3c7; border: 1px solid #fcd34d; color: #92400e; font-family: monospace; font-size: 0.75rem; align-self: center; max-width: 95%; }
+  .msg.whatsapp { background:transparent; border:none; align-self:center; max-width:95%; padding:0; }
+  .who-label { font-size: 0.625rem; font-weight: 700; margin-bottom: 0.25rem; opacity: 0.7; text-transform: uppercase; }
+  
+  /* STATUS BAR & MIC */
+  .status-bar { padding: 1rem; text-align: center; border-top: 1px solid var(--border); background: white; }
+  .status-indicator { display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; font-weight: 600; color: #64748b; margin-bottom: 0.75rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; }
+  .status.listening .dot { background: #ef4444; animation: pulse 1s infinite; }
+  .status.speaking .dot { background: var(--primary); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  #mic-select { width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px; font-size: 0.875rem; margin-bottom: 0.75rem; background: white; }
+  #btn { width: 100%; padding: 1rem; background: var(--primary); color: white; border: none; border-radius: 12px; font-weight: 700; font-size: 1rem; cursor: pointer; transition: all 0.2s; }
+  #btn:hover:not(:disabled) { background: #1d4ed8; transform: translateY(-1px); }
+  #btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #btn.live { background: #ef4444; }
+  
+  /* METRICS */
+  .metrics { display: flex; justify-content: space-between; padding: 0.5rem 1rem; background: #f1f5f9; font-size: 0.75rem; font-family: monospace; color: #64748b; }
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1>${AGENT.name}</h1>
-    <span class="status idle" id="status"><span id="status-text">idle</span></span>
-    <span class="meter"><span id="elapsed">0:00</span><span id="cost">$0.000</span></span>
-  </header>
-
-  <div class="panes">
-    <section class="pane">
-      <div class="pane-head"><span>Transcript</span></div>
-      <div class="pane-body" id="transcript">
-        <div class="empty">Start the call and talk. Partial transcripts appear as they stream, and tool calls show up inline.</div>
+  <!-- LEFT: DEMO CONTROLS -->
+  <div class="controls-panel">
+    <div class="panel-header">
+      <p>Demo Walkthrough</p>
+      <h2>Parkbase Controls</h2>
+    </div>
+    <div class="panel-body">
+      <div class="control-group">
+        <h3>Entry Scenarios</h3>
+        <button class="btn-primary" onclick="alert('Session Reset!')">▶ New Ticket (Reset)</button>
+        <button class="btn-outline" onclick="alert('Simulating Lot Full...')">⚠️ Simulate Lot Full</button>
       </div>
-      <div class="pane-foot">
-        <select id="mic" aria-label="Microphone"><option value="">Default microphone</option></select>
-        <button id="btn">Start call</button>
+      <div class="control-group">
+        <h3>Vehicle Type</h3>
+        <div class="vehicle-grid">
+          <button class="vehicle-btn active">Auto</button>
+          <button class="vehicle-btn">4W</button>
+          <button class="vehicle-btn">2W</button>
+        </div>
       </div>
-    </section>
-    <section class="pane" id="side">
-      <div class="pane-head">
-        <span class="tabs">
-          <button class="ghost tab on" id="tab-events">Events</button>
-          <button class="ghost tab" id="tab-agent">Agent</button>
-        </span>
-        <button class="ghost" id="log-toggle">Hide</button>
+      <div class="control-group">
+        <h3>Exit Scenarios</h3>
+        <button class="btn-outline">🅿️ Exit — Overstay</button>
+        <button class="btn-outline">✅ Exit — Completed</button>
       </div>
-      <div class="pane-body" id="events-body">
-        <div class="empty">Every websocket frame, both directions. Repeats collapse into a count.</div>
+      
+      <!-- SYSTEM LOGS -->
+      <div class="system-logs-container">
+        <h3>Live System Logs</h3>
+        <div id="system-logs"></div>
       </div>
-      <div class="pane-body" id="agent-body" hidden>
-        <div class="empty">Loading the published agent.</div>
-      </div>
-    </section>
+    </div>
   </div>
-</main>
+
+  <!-- RIGHT: PHONE MOCKUP -->
+  <div class="phone-wrapper">
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="app-header">
+          <h1>PARKBASE</h1>
+          <span>Voice Parking Assistant</span>
+        </div>
+        
+        <div id="chat-area">
+          <div class="empty" style="text-align:center; color:#94a3b8; margin-top:2rem; font-size:0.875rem;">Tap "Start Call" to begin<br>your parking journey</div>
+        </div>
+
+        <div class="metrics">
+          <span id="elapsed">0:00</span>
+          <span id="cost">$0.000</span>
+        </div>
+
+        <div class="status-bar">
+          <div class="status-indicator status idle" id="status">
+            <span class="dot"></span>
+            <span id="status-text">Ready to talk</span>
+          </div>
+          <select id="mic" aria-label="Microphone"><option value="">Default microphone</option></select>
+          <button id="btn">Start Call</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>window.AGENT = ${JSON.stringify(AGENT).replace(/</g, '\\u003c')}</script>
 <script src="/app.js"></script>
 </body>
 </html>`
 
-// --- server ----------------------------------------------------------------
-
-// Read-only view of the stored agent. The API keeps header values and llm keys
-// write-only; these deletes hold even if that changes. The system prompt is in
-// here, so a public deployment shows it to anyone who opens the page.
-function publicAgent(agent) {
-  const copy = structuredClone(agent)
-  for (const tool of copy.tools ?? []) {
-    for (const header of tool.http?.headers ?? []) header.value = '<hidden>'
-  }
-  for (const llm of copy.llm ?? []) delete llm.api_key
-  return copy
-}
-
+// --- SERVER LOGIC ---
 const server = http.createServer(async (req, res) => {
   if (req.url === '/agent') {
     try {
       const agent = await aai(`/agents/${AGENT.id}`)
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(publicAgent(agent)))
-    } catch (error) {
-      console.error(error.message)
-      res.writeHead(502, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'could not load the agent' }))
-    }
+      res.end(JSON.stringify(agent))
+    } catch (error) { res.writeHead(502); res.end(JSON.stringify({ error: 'failed' })) }
     return
   }
   if (req.url === '/token') {
@@ -814,11 +464,7 @@ const server = http.createServer(async (req, res) => {
       const token = await aai('/token?product=voice_agent&expires_in_seconds=60')
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(token))
-    } catch (error) {
-      console.error(error.message)
-      res.writeHead(502, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'token request failed' }))
-    }
+    } catch (error) { res.writeHead(502); res.end(JSON.stringify({ error: 'failed' })) }
     return
   }
   if (req.url === '/app.js') {
@@ -830,15 +476,7 @@ const server = http.createServer(async (req, res) => {
   res.end(HTML)
 })
 
-// PORT when set, otherwise 3000 and up until one is free.
 let port = Number(process.env.PORT) || 3000
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE' && !process.env.PORT && port < 3010) {
-    port += 1
-    server.listen(port)
-    return
-  }
-  throw err
-})
-server.on('listening', () => console.log(`Talk to it: http://localhost:${port}`))
+server.on('error', (err) => { if (err.code === 'EADDRINUSE' && !process.env.PORT && port < 3010) { port += 1; server.listen(port); return; } throw err })
+server.on('listening', () => console.log(`Parkbase Demo: http://localhost:${port}`))
 server.listen(port)
