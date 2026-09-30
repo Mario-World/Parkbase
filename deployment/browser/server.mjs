@@ -73,12 +73,12 @@ const backend = new ParkbaseBackend();
 // 2. AGENT SETUP
 // ==============================================================================
 const AGENT = await (async () => {
-  const name = process.env.AGENT || 'parkbase'
+  const name = process.env.AGENT || 'minimal' // reads 'minimal' from .env
   const known = storedAgentId(name)
   if (known) {
     try {
       const agent = await aai(`/agents/${known}`)
-      return { id: known, name: agent.name || 'Parkbase' }
+      return { id: known, name: agent.name || 'Parkbase Voice Agent' }
     } catch (error) { console.error(error.message); process.exit(1) }
   }
   const agent = readAgent(name)
